@@ -1,0 +1,8 @@
+[package]
+name = "crusher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parquet = "54.3.0"
+sqlparser = "0.55.0"
