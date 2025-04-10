@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::ops::Deref;
 
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
@@ -50,22 +51,11 @@ fn _sql() {
     println!("AST: {:?}", ast);
 }
 
-trait Filter {
+trait Filter: Debug {
     fn next_group(&mut self, reader: &dyn RowGroupReader);
     fn skip(&mut self, count: usize);
     fn check(&mut self) -> Option<bool>;
     fn next(&mut self) -> Option<usize>;
-}
-
-trait Handler {
-    fn handle(&mut self, row: u32);
-    fn result();
-}
-
-fn process<F: Iterator<Item = u32>, H: Handler>(filter: &mut F, handler: &mut H) {
-    for v in filter {
-        handler.handle(v);
-    }
 }
 
 struct StringFieldFilter {
@@ -73,8 +63,8 @@ struct StringFieldFilter {
     column: usize,
     column_reader: Option<ColumnReaderImpl<ByteArrayType>>,
     buffer: Vec<ByteArray>,
-    buffer_from: usize,
-    buffer_offset: usize,
+    buffer_pos: usize,
+    buffer_start: usize,
     to_skip: usize,
     def_levels: Vec<i16>,
     rep_levels: Vec<i16>,
@@ -88,8 +78,8 @@ impl StringFieldFilter {
             column,
             column_reader: None,
             buffer: Vec::with_capacity(size),
-            buffer_from: 0,
-            buffer_offset: 0,
+            buffer_pos: 0,
+            buffer_start: 0,
             to_skip: 0,
             def_levels: Vec::with_capacity(size),
             rep_levels: Vec::with_capacity(size),
@@ -97,9 +87,24 @@ impl StringFieldFilter {
     }
 }
 
+impl Debug for StringFieldFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringFieldFilter")
+            .field("value", &self.value)
+            .field("column", &self.column)
+            .field("buffer len", &self.buffer.len())
+            .field("buffer_start", &self.buffer_start)
+            .field("buffer_pos", &self.buffer_pos)
+            .field("to_skip", &self.to_skip)
+            .finish()
+    }
+}
+
 impl Filter for StringFieldFilter {
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
-        self.buffer_offset = 0;
+        self.buffer_start = 0;
+        self.buffer_pos = 0;
+        self.to_skip = 0;
         self.buffer.clear();
         if let ColumnReader::ByteArrayColumnReader(r) =
             reader.get_column_reader(self.column).unwrap()
@@ -111,16 +116,16 @@ impl Filter for StringFieldFilter {
     }
 
     fn skip(&mut self, mut count: usize) {
-        if !self.buffer.is_empty() && self.buffer_from < self.buffer.len() {
-            let reduce = count.min(self.buffer.len() - self.buffer_from);
-            self.buffer_from += reduce;
+        if !self.buffer.is_empty() && self.buffer_pos < self.buffer.len() {
+            let reduce = count.min(self.buffer.len() - self.buffer_pos);
+            self.buffer_pos += reduce;
             count -= reduce
         }
-        self.to_skip = count;
+        self.to_skip += count;
     }
 
     fn check(&mut self) -> Option<bool> {
-        if self.buffer.is_empty() || self.buffer_from == self.buffer.len() {
+        if self.buffer.is_empty() || self.buffer_pos == self.buffer.len() {
             if self.to_skip > 0 {
                 let result = self
                     .column_reader
@@ -129,9 +134,9 @@ impl Filter for StringFieldFilter {
                     .skip_records(self.to_skip)
                     .unwrap();
                 self.to_skip -= result;
-                self.buffer_offset += result;
+                self.buffer_start += result;
             }
-            self.buffer_offset += self.buffer.len();
+            self.buffer_start += self.buffer.len();
             self.buffer.clear();
             self.def_levels.clear();
             self.rep_levels.clear();
@@ -141,102 +146,107 @@ impl Filter for StringFieldFilter {
                 Some(&mut self.rep_levels),
                 &mut self.buffer,
             );
-            self.buffer_from = 0;
+            self.buffer_pos = 0;
             if result.is_err() || result.unwrap().0 == 0 {
                 return None;
             }
         }
-
         assert_eq!(self.to_skip, 0);
-        Some(self.buffer[self.buffer_from].data() == self.value.as_bytes())
+        Some(self.buffer[self.buffer_pos].data() == self.value.as_bytes())
     }
 
     fn next(&mut self) -> Option<usize> {
         while let Some(found) = self.check() {
             if found {
-                let res = self.buffer_offset + self.buffer_from;
-                self.buffer_from += 1;
+                let res = self.buffer_start + self.buffer_pos;
+                self.buffer_pos += 1;
                 return Some(res);
             }
-            self.buffer_from += 1;
+            self.buffer_pos += 1;
         }
         None
-        /*
-            if !self.buffer.is_empty() && self.buffer_from < self.buffer.len() {
-                assert_eq!(
-                    self.to_skip, 0,
-                    "all values in the buffer should be already skipped"
-                );
-                //println!("seatch from {} {}", self.buffer_offset, self.buffer_from);
-                for (i, item) in self.buffer[self.buffer_from..].iter().enumerate() {
-                    if item.data() == self.value.as_bytes() {
-                        let res = i + self.buffer_offset + self.buffer_from;
-                        self.buffer_from += i + 1;
-                        println!("found {res}");
-                        return Some(res);
-                    }
-                }
-            }
-            if self.to_skip > 0 {
-                let result = self
-                    .column_reader
-                    .as_mut()
-                    .expect("readed should be set before calling next")
-                    .skip_records(self.to_skip as usize)
-                    .unwrap();
-                assert_eq!(self.to_skip, result, "skip outside the group");
-                self.buffer_offset += self.to_skip;
-                self.to_skip = 0;
-            }
-            self.buffer_offset += self.buffer.len();
-            self.buffer.clear();
-            self.def_levels.clear();
-            self.rep_levels.clear();
-            let result = self.column_reader.as_mut().expect("").read_records(
-                self.buffer.capacity(),
-                Some(&mut self.def_levels),
-                Some(&mut self.rep_levels),
-                &mut self.buffer,
-            );
-            self.buffer_from = 0;
-            // println!("read {result:?}");
-            if result.is_err() || result.unwrap().0 == 0 {
-                return None;
-            }
-        }*/
     }
 }
 
+#[derive(Debug)]
 struct And {
     left: Box<dyn Filter>,
     right: Box<dyn Filter>,
-    position: usize,
+    position: isize,
 }
 
-impl Iterator for And {
-    type Item = usize;
+impl And {
+    fn new(left: Box<dyn Filter>, right: Box<dyn Filter>) -> Self {
+        Self {
+            left,
+            right,
+            position: -1,
+        }
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl Filter for And {
+    fn next(&mut self) -> Option<usize> {
         while let Some(position) = self.left.next() {
-            let diff = position - self.position;
-            if diff > 0 {
-                self.right.skip(diff - 1);
+            let to_skip = position as isize - self.position - 1;
+            if to_skip > 0 {
+                self.right.skip(to_skip as usize);
             }
-            if let Some(result) = self.right.next() {
-                return Some(result);
+            let result = self.right.check();
+            self.right.skip(1);
+            self.position = position as isize;
+            if let Some(true) = result {
+                return Some(position);
             }
         }
         None
     }
+
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        self.left.next_group(reader);
+        self.right.next_group(reader);
+        self.position = -1;
+    }
+
+    fn skip(&mut self, count: usize) {
+        self.left.skip(count);
+        self.right.skip(count);
+        self.position += count as isize;
+    }
+
+    fn check(&mut self) -> Option<bool> {
+        if self.left.check()? {
+            self.right.check()
+        } else {
+            Some(false)
+        }
+    }
 }
 
-/*
-2. check that skipn(1) + match() work the same way, 2 tests: skip1 + skip untill
-2.1 check multigroup
-3. implement and, check speed for l.next, r.skip, r.next....
-4. implement handler
+trait Handler {
+    fn handle(&mut self, row: usize);
+    fn result(); // TODO -> enum Value {String, Int64...}
+}
 
-*/
+struct Print {
+    column: usize,
+    column_reader: Option<ColumnReaderImpl<ByteArrayType>>,
+    buffer: Vec<ByteArray>,
+    buffer_start: usize,
+    to_skip: usize,
+    def_levels: Vec<i16>,
+    rep_levels: Vec<i16>,
+}
+
+impl Handler for Print {
+    fn handle(&mut self, row: usize) {
+        todo!()
+    }
+
+    fn result() {
+        todo!()
+    }
+}
 
 fn main() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -247,30 +257,36 @@ fn main() {
     if let Ok(file) = File::open(&path) {
         let reader = SerializedFileReader::new(file).unwrap();
 
-        let mut sff = StringFieldFilter::new(25, "KG".into());
-        // sff.skipn(1139058);
+        // let mut sff = StringFieldFilter::new(25, "KG".into());
+        let mut filter = And::new(
+            Box::new(StringFieldFilter::new(25, "US".into())),
+            Box::new(StringFieldFilter::new(24, "BROWSERTYPE_OTHER".into())),
+        );
+        // filter.skipn(1139058);
         let metadata = reader.metadata();
         let mut c = 0;
         for row_group in 0..metadata.num_row_groups() {
             let row_group_reader = reader.get_row_group(row_group).unwrap();
-            sff.skip(10000);
-            sff.next_group(row_group_reader.deref());
-            while let Some(v) = sff.next() {
+            filter.next_group(row_group_reader.deref());
+            while let Some(v) = filter.next() {
                 c += 1;
-                println!("{}", v + 1);
+                // println!("{}", v + 1);
             }
-
+            println!("{c}\n");
+            c = 0;
             println!("check&skip");
-            sff.next_group(row_group_reader.deref());
-            sff.skip(10000);
-            let mut v = 10000;
-            while let Some(res) = sff.check() {
+            filter.next_group(row_group_reader.deref());
+            let mut v = 14080 + 1;
+            while let Some(res) = filter.check() {
                 if res {
                     c += 1;
-                    println!("{}", v + 1);
+                    // println!("{}", v);
+                    // break;
                 }
                 v += 1;
-                sff.skip(1);
+                filter.skip(1);
+                // dbg!(&filter);
+                // break;
             }
         }
         println!("{c}");
