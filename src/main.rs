@@ -1,8 +1,8 @@
 use std::fmt::Debug;
 use std::ops::Deref;
 
-use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::data_type::{ByteArray, ByteArrayType};
+use parquet::column::reader::{ColumnReaderImpl, get_typed_column_reader};
+use parquet::data_type::{ByteArray, ByteArrayType, DataType};
 use parquet::file::reader::RowGroupReader;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -58,11 +58,10 @@ trait Filter: Debug {
     fn next(&mut self) -> Option<usize>;
 }
 
-struct StringFieldFilter {
-    value: String,
+struct ParquetColumnReader<T: DataType> {
     column: usize,
-    column_reader: Option<ColumnReaderImpl<ByteArrayType>>,
-    buffer: Vec<ByteArray>,
+    column_reader: Option<ColumnReaderImpl<T>>,
+    buffer: Vec<T::T>,
     buffer_pos: usize,
     buffer_start: usize,
     to_skip: usize,
@@ -70,11 +69,10 @@ struct StringFieldFilter {
     rep_levels: Vec<i16>,
 }
 
-impl StringFieldFilter {
-    fn new(column: usize, value: String) -> Self {
+impl<T: DataType> ParquetColumnReader<T> {
+    fn new(column: usize) -> Self {
         let size = 1024;
         Self {
-            value,
             column,
             column_reader: None,
             buffer: Vec::with_capacity(size),
@@ -85,34 +83,19 @@ impl StringFieldFilter {
             rep_levels: Vec::with_capacity(size),
         }
     }
-}
 
-impl Debug for StringFieldFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StringFieldFilter")
-            .field("value", &self.value)
-            .field("column", &self.column)
-            .field("buffer len", &self.buffer.len())
-            .field("buffer_start", &self.buffer_start)
-            .field("buffer_pos", &self.buffer_pos)
-            .field("to_skip", &self.to_skip)
-            .finish()
-    }
-}
-
-impl Filter for StringFieldFilter {
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
         self.buffer_start = 0;
         self.buffer_pos = 0;
         self.to_skip = 0;
         self.buffer.clear();
-        if let ColumnReader::ByteArrayColumnReader(r) =
-            reader.get_column_reader(self.column).unwrap()
-        {
-            self.column_reader = Some(r);
-        } else {
-            panic!()
-        }
+        self.column_reader = Some(get_typed_column_reader::<T>(
+            reader.get_column_reader(self.column).unwrap(),
+        ));
+    }
+
+    fn position(&self) -> usize {
+        self.buffer_start + self.buffer_pos + self.to_skip
     }
 
     fn set_position(&mut self, position: usize) {
@@ -125,7 +108,7 @@ impl Filter for StringFieldFilter {
         }
     }
 
-    fn check(&mut self) -> Option<bool> {
+    fn get(&mut self) -> Option<&T::T> {
         if self.buffer.is_empty() || self.buffer_pos == self.buffer.len() {
             if self.to_skip > 0 {
                 let result = self
@@ -153,17 +136,66 @@ impl Filter for StringFieldFilter {
             }
         }
         assert_eq!(self.to_skip, 0);
-        Some(self.buffer[self.buffer_pos].data() == self.value.as_bytes())
+        Some(&self.buffer[self.buffer_pos])
+    }
+}
+
+impl<T: DataType> Debug for ParquetColumnReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringFieldFilter")
+            .field("column", &self.column)
+            .field("buffer len", &self.buffer.len())
+            .field("buffer_start", &self.buffer_start)
+            .field("buffer_pos", &self.buffer_pos)
+            .field("to_skip", &self.to_skip)
+            .finish()
+    }
+}
+
+struct StringFieldFilter {
+    value: String,
+    reader: ParquetColumnReader<ByteArrayType>,
+}
+
+impl StringFieldFilter {
+    fn new(column: usize, value: String) -> Self {
+        let size = 1024;
+        Self {
+            value,
+            reader: ParquetColumnReader::new(column),
+        }
+    }
+}
+
+impl Debug for StringFieldFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringFieldFilter")
+            .field("value", &self.value)
+            .field("reader", &self.reader)
+            .finish()
+    }
+}
+
+impl Filter for StringFieldFilter {
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        self.reader.next_group(reader);
+    }
+
+    fn set_position(&mut self, position: usize) {
+        self.reader.set_position(position);
+    }
+
+    fn check(&mut self) -> Option<bool> {
+        self.reader.get().map(|v| v.data() == self.value.as_bytes())
     }
 
     fn next(&mut self) -> Option<usize> {
         while let Some(found) = self.check() {
+            let position = self.reader.position();
+            self.reader.set_position(position + 1);
             if found {
-                let res = self.buffer_start + self.buffer_pos;
-                self.buffer_pos += 1;
-                return Some(res);
+                return Some(position);
             }
-            self.buffer_pos += 1;
         }
         None
     }
@@ -213,23 +245,31 @@ impl Filter for And {
 }
 
 trait Handler {
+    fn next_group(&mut self, reader: &dyn RowGroupReader);
     fn handle(&mut self, row: usize);
     fn result(); // TODO -> enum Value {String, Int64...}
 }
 
 struct Print {
-    column: usize,
-    column_reader: Option<ColumnReaderImpl<ByteArrayType>>,
-    buffer: Vec<ByteArray>,
-    buffer_start: usize,
-    to_skip: usize,
-    def_levels: Vec<i16>,
-    rep_levels: Vec<i16>,
+    reader: ParquetColumnReader<ByteArrayType>,
+}
+
+impl Print {
+    fn new(column: usize) -> Self {
+        Self {
+            reader: ParquetColumnReader::new(column),
+        }
+    }
 }
 
 impl Handler for Print {
-    fn handle(&mut self, row: usize) {
-        todo!()
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        self.reader.next_group(reader);
+    }
+
+    fn handle(&mut self, position: usize) {
+        self.reader.set_position(position);
+        println!("{}", self.reader.get().unwrap().as_utf8().unwrap())
     }
 
     fn result() {
@@ -252,13 +292,16 @@ fn main() {
             Box::new(StringFieldFilter::new(24, "BROWSERTYPE_OTHER".into())),
         );
         // filter.skipn(1139058);
+        let mut handler = Print::new(23);
         let metadata = reader.metadata();
         let mut c = 0;
         for row_group in 0..metadata.num_row_groups() {
             let row_group_reader = reader.get_row_group(row_group).unwrap();
             filter.next_group(row_group_reader.deref());
+            handler.next_group(row_group_reader.deref());
             while let Some(v) = filter.next() {
                 c += 1;
+                handler.handle(v);
                 // println!("{}", v + 1);
             }
             println!("{c}\n");
@@ -269,7 +312,7 @@ fn main() {
             while let Some(res) = filter.check() {
                 if res {
                     c += 1;
-                    println!("{}", v + 1);
+                    // println!("{}", v + 1);
                     // break;
                 }
                 v += 2;
@@ -283,7 +326,11 @@ fn main() {
 }
 
 /*
-TODO
-2. handler,
+TODO:
+* Own types
+* group by
+* max,min,sum
+* error handling
+* what else for parser?
 
 */
