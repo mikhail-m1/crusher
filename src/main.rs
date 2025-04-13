@@ -53,7 +53,7 @@ fn _sql() {
 
 trait Filter: Debug {
     fn next_group(&mut self, reader: &dyn RowGroupReader);
-    fn skip(&mut self, count: usize);
+    fn set_position(&mut self, position: usize);
     fn check(&mut self) -> Option<bool>;
     fn next(&mut self) -> Option<usize>;
 }
@@ -115,13 +115,14 @@ impl Filter for StringFieldFilter {
         }
     }
 
-    fn skip(&mut self, mut count: usize) {
-        if !self.buffer.is_empty() && self.buffer_pos < self.buffer.len() {
-            let reduce = count.min(self.buffer.len() - self.buffer_pos);
-            self.buffer_pos += reduce;
-            count -= reduce
+    fn set_position(&mut self, position: usize) {
+        assert!(position >= self.buffer_start, "{position} {self:?}");
+        if position < self.buffer_start + self.buffer.len() {
+            self.buffer_pos = position - self.buffer_start;
+        } else {
+            self.buffer_pos = self.buffer.len();
+            self.to_skip = position - self.buffer_start - self.buffer.len();
         }
-        self.to_skip += count;
     }
 
     fn check(&mut self) -> Option<bool> {
@@ -172,29 +173,19 @@ impl Filter for StringFieldFilter {
 struct And {
     left: Box<dyn Filter>,
     right: Box<dyn Filter>,
-    position: isize,
 }
 
 impl And {
     fn new(left: Box<dyn Filter>, right: Box<dyn Filter>) -> Self {
-        Self {
-            left,
-            right,
-            position: -1,
-        }
+        Self { left, right }
     }
 }
 
 impl Filter for And {
     fn next(&mut self) -> Option<usize> {
         while let Some(position) = self.left.next() {
-            let to_skip = position as isize - self.position - 1;
-            if to_skip > 0 {
-                self.right.skip(to_skip as usize);
-            }
+            self.right.set_position(position);
             let result = self.right.check();
-            self.right.skip(1);
-            self.position = position as isize;
             if let Some(true) = result {
                 return Some(position);
             }
@@ -205,13 +196,11 @@ impl Filter for And {
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
         self.left.next_group(reader);
         self.right.next_group(reader);
-        self.position = -1;
     }
 
-    fn skip(&mut self, count: usize) {
-        self.left.skip(count);
-        self.right.skip(count);
-        self.position += count as isize;
+    fn set_position(&mut self, position: usize) {
+        self.left.set_position(position);
+        self.right.set_position(position);
     }
 
     fn check(&mut self) -> Option<bool> {
@@ -276,15 +265,15 @@ fn main() {
             c = 0;
             println!("check&skip");
             filter.next_group(row_group_reader.deref());
-            let mut v = 14080 + 1;
+            let mut v = 0;
             while let Some(res) = filter.check() {
                 if res {
                     c += 1;
-                    // println!("{}", v);
+                    println!("{}", v + 1);
                     // break;
                 }
-                v += 1;
-                filter.skip(1);
+                v += 2;
+                filter.set_position(v);
                 // dbg!(&filter);
                 // break;
             }
@@ -292,3 +281,9 @@ fn main() {
         println!("{c}");
     }
 }
+
+/*
+TODO
+2. handler,
+
+*/
