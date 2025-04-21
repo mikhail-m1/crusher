@@ -1,8 +1,12 @@
+#![allow(dead_code)]
+#![allow(unused)]
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::ops::Deref;
 
 use parquet::column::reader::{ColumnReaderImpl, get_typed_column_reader};
-use parquet::data_type::{ByteArray, ByteArrayType, DataType};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DataType, Int64Type};
 use parquet::file::reader::RowGroupReader;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -58,6 +62,67 @@ trait Filter: Debug {
     fn next(&mut self) -> Option<usize>;
 }
 
+#[derive(PartialEq, Debug, Clone)]
+enum Type {
+    I64(i64),
+    String(ByteArray),
+    Bool(bool),
+    Double(f64),
+    Null,
+}
+
+impl Eq for Type {}
+
+impl Hash for Type {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if let Type::String(a) = self {
+            a.data().hash(state);
+        } else {
+            core::mem::discriminant(self).hash(state);
+        }
+    }
+}
+
+impl From<Option<ByteArray>> for Type {
+    fn from(value: Option<ByteArray>) -> Self {
+        if let Some(value) = value {
+            Type::String(value)
+        } else {
+            Type::Null
+        }
+    }
+}
+
+impl From<Option<f64>> for Type {
+    fn from(value: Option<f64>) -> Self {
+        if let Some(value) = value {
+            Type::Double(value)
+        } else {
+            Type::Null
+        }
+    }
+}
+
+impl From<Option<bool>> for Type {
+    fn from(value: Option<bool>) -> Self {
+        if let Some(value) = value {
+            Type::Bool(value)
+        } else {
+            Type::Null
+        }
+    }
+}
+
+impl From<Option<i64>> for Type {
+    fn from(value: Option<i64>) -> Self {
+        if let Some(value) = value {
+            Type::I64(value)
+        } else {
+            Type::Null
+        }
+    }
+}
+
 struct ParquetColumnReader<T: DataType> {
     column: usize,
     column_reader: Option<ColumnReaderImpl<T>>,
@@ -89,6 +154,32 @@ impl<T: DataType> ParquetColumnReader<T> {
         self.buffer_pos = 0;
         self.to_skip = 0;
         self.buffer.clear();
+        match reader.get_column_reader(self.column).unwrap() {
+            parquet::column::reader::ColumnReader::BoolColumnReader(generic_column_reader) => {
+                println!("bool")
+            }
+            parquet::column::reader::ColumnReader::Int32ColumnReader(generic_column_reader) => {
+                println!("i32")
+            }
+            parquet::column::reader::ColumnReader::Int64ColumnReader(generic_column_reader) => {
+                println!("i64")
+            }
+            parquet::column::reader::ColumnReader::Int96ColumnReader(generic_column_reader) => {
+                println!("i96")
+            }
+            parquet::column::reader::ColumnReader::FloatColumnReader(generic_column_reader) => {
+                println!("fload")
+            }
+            parquet::column::reader::ColumnReader::DoubleColumnReader(generic_column_reader) => {
+                println!("doub")
+            }
+            parquet::column::reader::ColumnReader::ByteArrayColumnReader(generic_column_reader) => {
+                println!("var")
+            }
+            parquet::column::reader::ColumnReader::FixedLenByteArrayColumnReader(
+                generic_column_reader,
+            ) => println!("fix"),
+        }
         self.column_reader = Some(get_typed_column_reader::<T>(
             reader.get_column_reader(self.column).unwrap(),
         ));
@@ -152,14 +243,13 @@ impl<T: DataType> Debug for ParquetColumnReader<T> {
     }
 }
 
-struct StringFieldFilter {
-    value: String,
-    reader: ParquetColumnReader<ByteArrayType>,
+struct FieldFilter<T: DataType> {
+    value: T::T,
+    reader: ParquetColumnReader<T>,
 }
 
-impl StringFieldFilter {
-    fn new(column: usize, value: String) -> Self {
-        let size = 1024;
+impl<T: DataType> FieldFilter<T> {
+    fn new(column: usize, value: T::T) -> Self {
         Self {
             value,
             reader: ParquetColumnReader::new(column),
@@ -167,7 +257,7 @@ impl StringFieldFilter {
     }
 }
 
-impl Debug for StringFieldFilter {
+impl<T: DataType> Debug for FieldFilter<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StringFieldFilter")
             .field("value", &self.value)
@@ -176,7 +266,7 @@ impl Debug for StringFieldFilter {
     }
 }
 
-impl Filter for StringFieldFilter {
+impl<T: DataType> Filter for FieldFilter<T> {
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
         self.reader.next_group(reader);
     }
@@ -186,7 +276,7 @@ impl Filter for StringFieldFilter {
     }
 
     fn check(&mut self) -> Option<bool> {
-        self.reader.get().map(|v| v.data() == self.value.as_bytes())
+        self.reader.get().map(|v| *v == self.value)
     }
 
     fn next(&mut self) -> Option<usize> {
@@ -246,15 +336,16 @@ impl Filter for And {
 
 trait Handler {
     fn next_group(&mut self, reader: &dyn RowGroupReader);
-    fn handle(&mut self, row: usize);
-    fn result(); // TODO -> enum Value {String, Int64...}
+    fn handle(&mut self, position: usize);
+    fn result(&mut self) -> Type;
 }
 
-struct Print {
-    reader: ParquetColumnReader<ByteArrayType>,
+// TODO: remove? is it just impl on top of Reader
+struct Identity<T: DataType> {
+    reader: ParquetColumnReader<T>,
 }
 
-impl Print {
+impl<T: DataType> Identity<T> {
     fn new(column: usize) -> Self {
         Self {
             reader: ParquetColumnReader::new(column),
@@ -262,17 +353,146 @@ impl Print {
     }
 }
 
-impl Handler for Print {
+impl<T> Handler for Identity<T>
+where
+    T: DataType,
+    Option<T::T>: Into<Type>,
+{
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
         self.reader.next_group(reader);
     }
 
     fn handle(&mut self, position: usize) {
         self.reader.set_position(position);
-        println!("{}", self.reader.get().unwrap().as_utf8().unwrap())
     }
 
-    fn result() {
+    fn result(&mut self) -> Type {
+        self.reader.get().map(|v| v.clone()).into()
+    }
+}
+
+struct SingleValue<T: DataType, S>
+where
+    S: Fn(&T::T, &T::T) -> T::T,
+{
+    value: Option<T::T>,
+    reader: ParquetColumnReader<T>,
+    select: S,
+}
+
+impl<T: DataType, S> SingleValue<T, S>
+where
+    S: Fn(&T::T, &T::T) -> T::T,
+{
+    fn new(column: usize, select: S) -> Self {
+        Self {
+            value: None,
+            reader: ParquetColumnReader::new(column),
+            select,
+        }
+    }
+}
+
+impl<T: DataType, S> Handler for SingleValue<T, S>
+where
+    S: Fn(&T::T, &T::T) -> T::T,
+    Option<T::T>: Into<Type>,
+{
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        self.reader.next_group(reader);
+    }
+
+    fn handle(&mut self, position: usize) {
+        self.reader.set_position(position);
+        match (self.reader.get(), &self.value) {
+            (Some(n), Some(c)) => self.value = Some((self.select)(n, c)),
+            (Some(n), None) => self.value = Some(n.clone()),
+            _ => {}
+        }
+    }
+
+    fn result(&mut self) -> Type {
+        self.value.clone().into()
+    }
+}
+
+trait Fold {
+    fn fold(&self, result: &mut Type, value: Type);
+}
+
+impl<T: Fn(&mut Type, Type)> Fold for T {
+    fn fold(&self, result: &mut Type, value: Type) {
+        self(result, value)
+    }
+}
+
+struct Sum;
+impl Fold for Sum {
+    fn fold(&self, result: &mut Type, value: Type) {
+        match (result, value) {
+            (Type::I64(r), Type::I64(v)) => *r += v,
+            (r @ Type::Null, v @ Type::I64(_)) => *r = v,
+            _ => panic!(),
+        }
+    }
+}
+
+struct Group {
+    keys: Vec<Box<dyn Handler>>,
+    readers: Vec<Box<dyn Handler>>,
+    folds: Vec<Box<dyn Fold>>,
+    values: HashMap<Vec<Type>, Vec<Type>>,
+}
+
+impl Group {
+    fn new(
+        keys: Vec<Box<dyn Handler>>,
+        readers: Vec<Box<dyn Handler>>,
+        folds: Vec<Box<dyn Fold>>,
+    ) -> Self {
+        Self {
+            keys,
+            readers,
+            folds,
+            values: HashMap::new(),
+        }
+    }
+}
+
+impl Handler for Group {
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        for r in &mut self.readers {
+            r.next_group(reader);
+        }
+        for v in &mut self.keys {
+            v.next_group(reader);
+        }
+    }
+
+    fn handle(&mut self, position: usize) {
+        let key = self
+            .keys
+            .iter_mut()
+            .map(|k| {
+                k.handle(position);
+                k.result()
+            })
+            .collect::<Vec<_>>();
+        let value = self
+            .values
+            .entry(key)
+            .or_insert_with(|| vec![Type::Null; self.folds.len()]);
+        for (i, fold) in self.folds.iter().enumerate() {
+            let reader = &mut self.readers[i];
+            reader.handle(position);
+            fold.fold(&mut value[i], reader.result());
+        }
+    }
+
+    fn result(&mut self) -> Type {
+        for (k, v) in &self.values {
+            println!("{:?} {:?}", k, v);
+        }
         todo!()
     }
 }
@@ -288,11 +508,22 @@ fn main() {
 
         // let mut sff = StringFieldFilter::new(25, "KG".into());
         let mut filter = And::new(
-            Box::new(StringFieldFilter::new(25, "US".into())),
-            Box::new(StringFieldFilter::new(24, "BROWSERTYPE_OTHER".into())),
+            Box::new(FieldFilter::<Int64Type>::new(36, 42)),
+            // Box::new(FieldFilter::<ByteArrayType>::new(25, "US".into())),
+            Box::new(FieldFilter::<ByteArrayType>::new(
+                24,
+                "BROWSERTYPE_OTHER".into(),
+            )),
         );
         // filter.skipn(1139058);
-        let mut handler = Print::new(23);
+        let mut handler = Identity::<BoolType>::new(8); // 37 - double
+        // let mut handler = SingleValue::<ByteArrayType, _>::new(0, |a, b| {
+        //     if a.data() <= b.data() {
+        //         a.clone()
+        //     } else {
+        //         b.clone()
+        //     }
+        // });
         let metadata = reader.metadata();
         let mut c = 0;
         for row_group in 0..metadata.num_row_groups() {
@@ -302,9 +533,10 @@ fn main() {
             while let Some(v) = filter.next() {
                 c += 1;
                 handler.handle(v);
-                // println!("{}", v + 1);
+                println!("{} {:?}", v + 1, handler.result());
             }
             println!("{c}\n");
+            handler.result();
             c = 0;
             println!("check&skip");
             filter.next_group(row_group_reader.deref());
@@ -322,15 +554,37 @@ fn main() {
             }
         }
         println!("{c}");
+
+        let mut handler = Group::new(
+            vec![Box::new(Identity::<ByteArrayType>::new(0))],
+            vec![Box::new(Identity::<Int64Type>::new(36))],
+            vec![Box::new(Sum)],
+        );
+        let mut filter = FieldFilter::<ByteArrayType>::new(24, "BROWSERTYPE_OTHER".into());
+
+        for row_group in 0..metadata.num_row_groups() {
+            let row_group_reader = reader.get_row_group(row_group).unwrap();
+            filter.next_group(row_group_reader.deref());
+            handler.next_group(row_group_reader.deref());
+            while let Some(v) = filter.next() {
+                c += 1;
+                handler.handle(v);
+            }
+        }
+        handler.result();
     }
 }
 
 /*
 TODO:
-* Own types
-* group by
-* max,min,sum
-* error handling
-* what else for parser?
 
+* read without filter :)
+
+* group by
+    * result() -> ? is it different from Handler?
+    * think about layer between read and reulst, there is no need for handler?
+
+* error handling
+* tests
+* implement parser
 */
