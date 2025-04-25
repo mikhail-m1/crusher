@@ -340,34 +340,21 @@ trait Handler {
     fn result(&mut self) -> Type;
 }
 
-// TODO: remove? is it just impl on top of Reader
-struct Identity<T: DataType> {
-    reader: ParquetColumnReader<T>,
-}
-
-impl<T: DataType> Identity<T> {
-    fn new(column: usize) -> Self {
-        Self {
-            reader: ParquetColumnReader::new(column),
-        }
-    }
-}
-
-impl<T> Handler for Identity<T>
+impl<T> Handler for ParquetColumnReader<T>
 where
     T: DataType,
     Option<T::T>: Into<Type>,
 {
     fn next_group(&mut self, reader: &dyn RowGroupReader) {
-        self.reader.next_group(reader);
+        self.next_group(reader);
     }
 
     fn handle(&mut self, position: usize) {
-        self.reader.set_position(position);
+        self.set_position(position);
     }
 
     fn result(&mut self) -> Type {
-        self.reader.get().map(|v| v.clone()).into()
+        self.get().map(|v| v.clone()).into()
     }
 }
 
@@ -516,7 +503,7 @@ fn main() {
             )),
         );
         // filter.skipn(1139058);
-        let mut handler = Identity::<BoolType>::new(8); // 37 - double
+        let mut handler = ParquetColumnReader::<BoolType>::new(8); // 37 - double
         // let mut handler = SingleValue::<ByteArrayType, _>::new(0, |a, b| {
         //     if a.data() <= b.data() {
         //         a.clone()
@@ -556,18 +543,27 @@ fn main() {
         println!("{c}");
 
         let mut handler = Group::new(
-            vec![Box::new(Identity::<ByteArrayType>::new(0))],
-            vec![Box::new(Identity::<Int64Type>::new(36))],
+            vec![Box::new(ParquetColumnReader::<ByteArrayType>::new(0))],
+            vec![Box::new(ParquetColumnReader::<Int64Type>::new(36))],
             vec![Box::new(Sum)],
         );
-        let mut filter = FieldFilter::<ByteArrayType>::new(24, "BROWSERTYPE_OTHER".into());
-
+        /*
+                let mut filter = FieldFilter::<ByteArrayType>::new(24, "BROWSERTYPE_OTHER".into());
+                for row_group in 0..metadata.num_row_groups() {
+                    let row_group_reader = reader.get_row_group(row_group).unwrap();
+                    filter.next_group(row_group_reader.deref());
+                    handler.next_group(row_group_reader.deref());
+                    while let Some(v) = filter.next() {
+                        c += 1;
+                        handler.handle(v);
+                    }
+                }
+                handler.result();
+        */
         for row_group in 0..metadata.num_row_groups() {
             let row_group_reader = reader.get_row_group(row_group).unwrap();
-            filter.next_group(row_group_reader.deref());
             handler.next_group(row_group_reader.deref());
-            while let Some(v) = filter.next() {
-                c += 1;
+            for v in 0..row_group_reader.metadata().num_rows() as usize {
                 handler.handle(v);
             }
         }
@@ -577,13 +573,18 @@ fn main() {
 
 /*
 TODO:
-
-* read without filter :)
-
 * group by
     * result() -> ? is it different from Handler?
     * think about layer between read and reulst, there is no need for handler?
+     Q: do we need to divide handler and result? two pattersn of use in one interface:
+        handler, result, hadnle, result, ... -> for functions like A -> B
+        handle, ...., handler, result for Fold
+        looks liket the second is more like Fold if Type is a Vec<Type>
+    A: need to extract reader from filter and Agg interface for group
 
+* intermidaite tables, is it Type? if so, can we convert input table to Type too? but async
+
+]=
 * error handling
 * tests
 * implement parser
