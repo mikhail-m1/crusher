@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused)]
+use std::cell::LazyCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -55,10 +56,10 @@ fn _sql() {
     println!("AST: {:?}", ast);
 }
 
+// REMOVE
 trait Filter: Debug {
     fn next_group(&mut self, reader: &dyn RowGroupReader);
-    fn set_position(&mut self, position: usize);
-    fn check(&mut self) -> Option<bool>;
+    fn check(&mut self, position: usize) -> Option<bool>;
     fn next(&mut self) -> Option<usize>;
 }
 
@@ -80,6 +81,12 @@ impl Hash for Type {
         } else {
             core::mem::discriminant(self).hash(state);
         }
+    }
+}
+
+impl From<ByteArray> for Type {
+    fn from(value: ByteArray) -> Self {
+        Type::String(value)
     }
 }
 
@@ -243,11 +250,40 @@ impl<T: DataType> Debug for ParquetColumnReader<T> {
     }
 }
 
+trait ParquetColumn {
+    fn next_group(&mut self, reader: &dyn RowGroupReader);
+    fn get(&mut self, position: usize) -> Type;
+    // fn get_o(&mut self, position: usize) -> Option<Type>;
+}
+
+impl<T> ParquetColumn for ParquetColumnReader<T>
+where
+    T: DataType,
+    Option<T::T>: Into<Type>,
+{
+    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+        self.next_group(reader);
+    }
+
+    fn get(&mut self, position: usize) -> Type {
+        self.set_position(position);
+        self.get().map(|v| v.clone()).into()
+    }
+
+    /*
+    fn get_o(&mut self, position: usize) -> Option<Type> {
+        self.set_position(position);
+        self.get().map(|v| v.clone().into())
+    }*/
+}
+
+// REMOVE
 struct FieldFilter<T: DataType> {
     value: T::T,
     reader: ParquetColumnReader<T>,
 }
 
+// REMOVE
 impl<T: DataType> FieldFilter<T> {
     fn new(column: usize, value: T::T) -> Self {
         Self {
@@ -257,6 +293,7 @@ impl<T: DataType> FieldFilter<T> {
     }
 }
 
+// REMOVE
 impl<T: DataType> Debug for FieldFilter<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StringFieldFilter")
@@ -271,16 +308,13 @@ impl<T: DataType> Filter for FieldFilter<T> {
         self.reader.next_group(reader);
     }
 
-    fn set_position(&mut self, position: usize) {
+    fn check(&mut self, position: usize) -> Option<bool> {
         self.reader.set_position(position);
-    }
-
-    fn check(&mut self) -> Option<bool> {
         self.reader.get().map(|v| *v == self.value)
     }
 
     fn next(&mut self) -> Option<usize> {
-        while let Some(found) = self.check() {
+        while let Some(found) = self.reader.get().map(|v| *v == self.value) {
             let position = self.reader.position();
             self.reader.set_position(position + 1);
             if found {
@@ -306,8 +340,7 @@ impl And {
 impl Filter for And {
     fn next(&mut self) -> Option<usize> {
         while let Some(position) = self.left.next() {
-            self.right.set_position(position);
-            let result = self.right.check();
+            let result = self.right.check(position);
             if let Some(true) = result {
                 return Some(position);
             }
@@ -320,14 +353,9 @@ impl Filter for And {
         self.right.next_group(reader);
     }
 
-    fn set_position(&mut self, position: usize) {
-        self.left.set_position(position);
-        self.right.set_position(position);
-    }
-
-    fn check(&mut self) -> Option<bool> {
-        if self.left.check()? {
-            self.right.check()
+    fn check(&mut self, position: usize) -> Option<bool> {
+        if self.left.check(position)? {
+            self.right.check(position)
         } else {
             Some(false)
         }
@@ -424,6 +452,94 @@ impl Fold for Sum {
     }
 }
 
+///////////// new traits
+
+trait Readers {
+    fn get(&mut self, column: usize, position: usize) -> Option<Type>;
+}
+
+trait Filter2 {
+    fn next(&mut self, readers: &mut dyn Readers) -> Option<usize>;
+}
+
+trait Mapper {
+    fn map(&mut self, position: usize, readers: &mut dyn Readers) -> Type;
+}
+
+trait Processor {
+    //    fn handle(&mut self, position: usize, readers: &mut dyn Readers);
+    fn next(&mut self, readers: &mut dyn Readers) -> Option<Vec<Type>>;
+}
+
+//////////////////  minimal implementations
+
+struct ParquetReaders {
+    readers: Vec<Box<dyn ParquetColumn>>,
+}
+
+impl Readers for ParquetReaders {
+    fn get(&mut self, column: usize, position: usize) -> Option<Type> {
+        Some(self.readers[column].get(position)) // FIXME
+    }
+}
+
+struct All {
+    position: usize,
+}
+impl Filter2 for All {
+    fn next(&mut self, readers: &mut dyn Readers) -> Option<usize> {
+        let value = readers.get(0, self.position); //FIXME
+        let p = self.position;
+        self.position += 1;
+        if let Type::Null = value.unwrap() {
+            //FIXME: need to get None
+            None
+        } else {
+            Some(p)
+        }
+    }
+}
+
+struct AsIsMapper {
+    column: usize,
+}
+
+impl Mapper for AsIsMapper {
+    fn map(&mut self, position: usize, readers: &mut dyn Readers) -> Type {
+        readers.get(self.column, position).unwrap()
+    }
+}
+
+struct AsIsProcessor {
+    mappers: Vec<Box<dyn Mapper>>,
+    filter: Box<dyn Filter2>,
+}
+
+impl Processor for AsIsProcessor {
+    fn next(&mut self, readers: &mut dyn Readers) -> Option<Vec<Type>> {
+        if let Some(position) = self.filter.next(readers) {
+            Some(
+                self.mappers
+                    .iter_mut()
+                    .map(|m| m.map(position, readers))
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+fn _example(readers: &mut dyn Readers) {
+    let mut p = AsIsProcessor {
+        mappers: vec![Box::new(AsIsMapper { column: 0 })],
+        filter: Box::new(All { position: 0 }),
+    };
+    while let Some(v) = p.next(readers) {
+        println!("{v:?}");
+    }
+}
+
 struct Group {
     keys: Vec<Box<dyn Handler>>,
     readers: Vec<Box<dyn Handler>>,
@@ -492,6 +608,19 @@ fn main() {
     let path = Path::new("flat_1m.parquet");
     if let Ok(file) = File::open(&path) {
         let reader = SerializedFileReader::new(file).unwrap();
+        let metadata = reader.metadata();
+
+        // ************************** new
+        let mut readers = ParquetReaders {
+            readers: vec![Box::new(ParquetColumnReader::<ByteArrayType>::new(0))],
+        };
+        for row_group in 0..metadata.num_row_groups() {
+            let row_group_reader = reader.get_row_group(row_group).unwrap();
+            readers.readers[0].next_group(row_group_reader.deref());
+            _example(&mut readers);
+        }
+
+        // **************************
 
         // let mut sff = StringFieldFilter::new(25, "KG".into());
         let mut filter = And::new(
@@ -511,7 +640,6 @@ fn main() {
         //         b.clone()
         //     }
         // });
-        let metadata = reader.metadata();
         let mut c = 0;
         for row_group in 0..metadata.num_row_groups() {
             let row_group_reader = reader.get_row_group(row_group).unwrap();
@@ -528,14 +656,13 @@ fn main() {
             println!("check&skip");
             filter.next_group(row_group_reader.deref());
             let mut v = 0;
-            while let Some(res) = filter.check() {
+            while let Some(res) = filter.check(v) {
                 if res {
                     c += 1;
                     // println!("{}", v + 1);
                     // break;
                 }
                 v += 2;
-                filter.set_position(v);
                 // dbg!(&filter);
                 // break;
             }
