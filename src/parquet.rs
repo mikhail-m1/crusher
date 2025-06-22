@@ -72,7 +72,7 @@ enum Output<'a, T: DataType> {
 
 impl<T: DataType> ParquetColumnReader<T> {
     fn new(column: usize) -> Self {
-        let size = 1024;
+        let size = 10240;
         Self {
             column,
             column_reader: None,
@@ -146,7 +146,7 @@ impl<T: DataType> ParquetColumnReader<T> {
                 .map_err(ProcessingError::ParquetError)?;
             // dbg!(&result, &self.def_levels, &self.rep_levels);
             self.buffer_pos = 0;
-            assert_ne!(result.0, 0, "Read outside of group");
+            assert_ne!(result.0, 0, "Read outside of group {self:?}");
         }
         assert_eq!(self.to_skip, 0);
         if self.def_levels[self.buffer_pos] == 0 {
@@ -234,7 +234,7 @@ pub struct ParquetReaders {
     names: Vec<String>,
     types: Vec<ReaderType>,
     readers: Vec<Box<dyn ParquetColumn>>,
-    group_rows: usize,
+    rows_in_group: Vec<usize>,
     total_rows: usize,
     current_row_group: usize,
     file_reader: Box<dyn FileReader>,
@@ -247,10 +247,12 @@ impl ParquetReaders {
             panic!()
         }
         let row_group = metadata.row_group(0);
-        let group_rows = row_group.num_rows() as usize;
+        let mut rows_in_group = Vec::with_capacity(row_group.num_columns());
         let mut names = Vec::with_capacity(row_group.num_columns());
         let mut readers = Vec::with_capacity(row_group.num_columns());
         let mut types = Vec::with_capacity(row_group.num_columns());
+        rows_in_group.push(row_group.num_rows() as usize);
+        let group_rows = row_group.num_rows() as usize;
         for column in row_group.columns().iter() {
             let descr = column.column_descr();
             names.push(descr.name().to_string());
@@ -264,34 +266,46 @@ impl ParquetReaders {
                 descr.logical_type(),
             ))
         }
-        let mut total_rows = group_rows;
-        for row_groups in &metadata.row_groups()[1..] {
+        let mut total_rows = row_group.num_rows() as usize;
+
+        for row_group in &metadata.row_groups()[1..] {
+            rows_in_group.push(rows_in_group.last().unwrap() + row_group.num_rows() as usize);
             total_rows += row_group.num_rows() as usize;
             //TODO: check schema
         }
-        {
-            let row_group = file_reader.get_row_group(0).unwrap();
-            for reader in &mut readers {
-                reader.next_group(row_group.deref());
-            }
-        }
-
-        Self {
+        let mut result = Self {
             names,
             types,
             readers,
-            total_rows: total_rows,
+            total_rows,
             current_row_group: 0,
-            group_rows,
+            rows_in_group,
             file_reader,
+        };
+        result.init_row_group(0);
+        result
+    }
+
+    fn init_row_group(&mut self, row_group: usize) {
+        let row_group = self.file_reader.get_row_group(row_group).unwrap();
+        for reader in &mut self.readers {
+            reader.next_group(row_group.deref());
         }
     }
 }
 
 impl Readers for ParquetReaders {
     fn get(&mut self, column: usize, position: usize) -> Result<Type, ProcessingError> {
-        assert!(position < self.group_rows); // TODO: switch to other groups
-        self.readers[column].get(position)
+        if position >= self.rows_in_group[self.current_row_group] {
+            self.current_row_group += 1;
+            self.init_row_group(self.current_row_group);
+        }
+        let offset = if self.current_row_group == 0 {
+            0
+        } else {
+            self.rows_in_group[self.current_row_group - 1]
+        };
+        self.readers[column].get(position - offset)
     }
     fn row_count(&self) -> usize {
         self.total_rows
@@ -302,7 +316,7 @@ impl Readers for ParquetReaders {
     }
 
     fn column_count(&self) -> usize {
-        todo!()
+        self.names.len()
     }
 
     fn find(&self, name: &str) -> Option<usize> {

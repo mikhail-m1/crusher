@@ -79,6 +79,7 @@ pub fn to_process(
         todo!()
         // Box::new(Group::new(filters, projections, keys, folds))
     };
+    // dbg!(&select.from);
 
     Ok(processor)
 }
