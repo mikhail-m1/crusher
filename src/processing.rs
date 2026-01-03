@@ -4,6 +4,7 @@ use parquet::data_type::ByteArray;
 use parquet::errors::ParquetError;
 use std::cell::LazyCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::hash::Hash;
 use thiserror::Error;
 
@@ -13,6 +14,8 @@ pub enum ProcessingError {
     ParquetError(#[from] ParquetError),
     #[error("Parsing error")]
     Parsing(#[from] ParsingError),
+    #[error("Invaid buffer type")]
+    InvalidBufferType,
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -42,6 +45,26 @@ impl Hash for Type {
 
 ///////////// traits
 
+pub trait Filter {
+    fn check(&mut self, values: &[Type]) -> bool;
+}
+
+pub trait Source {
+    fn findx(
+        &mut self,
+        filter_columns: &[usize],
+        filter: &mut Box<dyn Filter>, // need mut here?
+    ) -> Result<bool, ProcessingError>;
+    fn get(&mut self, columns: &[usize]) -> Result<&[Type], ProcessingError>;
+    //fn rows(&mut self) -> Result<usize, ProcessingError>;
+    //TODO:
+    // fn column_by_name(&self, name: &str) -> Option<usize>;
+    // fn get_type(&self, column: usize) -> ReaderType;
+    // fn column_count(&self) -> usize;
+    //TODO2:
+    // fn find_next_row_with_one_of(&[Type]) -> usize //can be optimized
+}
+
 pub trait Readers {
     fn get(&mut self, column: usize, position: usize) -> Result<Type, ProcessingError>;
     fn row_count(&self) -> usize;
@@ -54,6 +77,7 @@ pub trait Mapper {
     fn map(&mut self, position: usize, readers: &mut dyn Readers) -> Type;
 }
 
+// TODO: should it return Source, or just remove processsor at all?
 pub trait Processor {
     fn next(&mut self, readers: &mut dyn Readers) -> Option<Vec<Type>>;
 }
@@ -62,12 +86,13 @@ pub trait Fold {
     fn fold(&self, current: &mut Type, value: Type);
 }
 
+#[derive(Clone, Copy)]
 pub enum ReaderType {
-    I32,
-    I64,
-    Bool,
-    Double,
-    String,
+    I32 = 0,
+    I64 = 1,
+    Bool = 2,
+    Double = 3,
+    String = 4,
 }
 
 //////////////////  implementations

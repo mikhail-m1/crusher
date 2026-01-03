@@ -6,5 +6,25 @@ edition = "2024"
 [dependencies]
 parquet = "54.3.0"
 sqlparser = "0.55.0"
-thiserror = "2.0"
+thiserror = "2"
 bytes = "1.10"
+recycle_vec = "1.1.2"
+
+#hotpath = { version = "0.5", optional = true }
+
+[profile.release]
+debug = "line-tables-only"
+
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+#[features]
+#hotpath = ["dep:hotpath", "hotpath/hotpath"]
+#hotpath-alloc-bytes-total = ["hotpath/hotpath-alloc-bytes-total"]
+#hotpath-alloc-count-total = ["hotpath/hotpath-alloc-count-total"]
+#hotpath-alloc-self = ["hotpath/hotpath-alloc-self"]
+#hotpath-off = ["hotpath/hotpath-off"]
+
+
+#[dev-dependencies]
+#criterion = { version = "0.5", features = ["html_reports"] }

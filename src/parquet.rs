@@ -1,6 +1,6 @@
 use super::processing::*;
 use parquet::basic::{LogicalType, StringType, Type as PhysicalType};
-use parquet::column::reader::{ColumnReaderImpl, get_typed_column_reader};
+use parquet::column::reader::{get_typed_column_reader, ColumnReaderImpl};
 use parquet::data_type::{
     BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FloatType, Int32Type, Int64Type,
     Int96, Int96Type,
@@ -8,6 +8,7 @@ use parquet::data_type::{
 use parquet::errors::ParquetError;
 use parquet::file::reader::{self, FileReader, RowGroupReader};
 use std::fmt::Debug;
+use std::fs::ReadDir;
 use std::ops::Deref;
 
 impl From<ByteArray> for Type {
@@ -65,13 +66,13 @@ pub struct ParquetColumnReader<T: DataType> {
     rep_levels: Vec<i16>,
 }
 
-enum Output<'a, T: DataType> {
+pub enum Output<'a, T: DataType> {
     Null,
     Some(&'a T::T),
 }
 
 impl<T: DataType> ParquetColumnReader<T> {
-    fn new(column: usize) -> Self {
+    pub fn new(column: usize) -> Self {
         let size = 10240;
         Self {
             column,
@@ -86,7 +87,7 @@ impl<T: DataType> ParquetColumnReader<T> {
         }
     }
 
-    fn next_group(&mut self, reader: &dyn RowGroupReader) {
+    pub fn next_group(&mut self, reader: &dyn RowGroupReader) {
         self.buffer_start = 0;
         self.buffer_pos = 0;
         self.to_skip = 0;
@@ -97,11 +98,11 @@ impl<T: DataType> ParquetColumnReader<T> {
         ));
     }
 
-    fn position(&self) -> usize {
+    pub fn position(&self) -> usize {
         self.buffer_start + self.buffer_pos + self.to_skip
     }
 
-    fn set_position(&mut self, position: usize) {
+    pub fn set_position(&mut self, position: usize) {
         assert!(position >= self.buffer_start, "{position} {self:?}");
         if position <= self.buffer_start + self.buffer.len() {
             self.nulls_count += self.def_levels[self.buffer_pos..position - self.buffer_start]
@@ -117,7 +118,7 @@ impl<T: DataType> ParquetColumnReader<T> {
         }
     }
 
-    fn get(&mut self) -> Result<Output<T>, ProcessingError> {
+    pub fn get(&'_ mut self) -> Result<Output<'_, T>, ProcessingError> {
         if self.buffer.is_empty() || self.buffer_pos == self.def_levels.len() {
             if self.to_skip > 0 {
                 let result = self
@@ -150,11 +151,52 @@ impl<T: DataType> ParquetColumnReader<T> {
         }
         assert_eq!(self.to_skip, 0);
         if self.def_levels[self.buffer_pos] == 0 {
+            // BUG? should the nulls_count be incremented?
             Ok(Output::Null)
         } else {
             Ok(Output::Some(
                 &self.buffer[self.buffer_pos - self.nulls_count],
             ))
+        }
+    }
+
+    pub fn get2(&'_ mut self, output: &mut T::T) -> Result<bool, ProcessingError> {
+        if self.buffer.is_empty() || self.buffer_pos == self.def_levels.len() {
+            if self.to_skip > 0 {
+                let result = self
+                    .column_reader
+                    .as_mut()
+                    .expect("msg")
+                    .skip_records(self.to_skip)
+                    .unwrap();
+                self.to_skip -= result;
+                self.buffer_start += result;
+            }
+            self.buffer_start += self.buffer.len();
+            self.buffer.clear();
+            self.def_levels.clear();
+            self.rep_levels.clear();
+            let result = self
+                .column_reader
+                .as_mut()
+                .expect("msg")
+                .read_records(
+                    self.buffer.capacity(),
+                    Some(&mut self.def_levels),
+                    Some(&mut self.rep_levels),
+                    &mut self.buffer,
+                )
+                .map_err(ProcessingError::ParquetError)?;
+            // dbg!(&result, &self.def_levels, &self.rep_levels);
+            self.buffer_pos = 0;
+            assert_ne!(result.0, 0, "Read outside of group {self:?}");
+        }
+        assert_eq!(self.to_skip, 0);
+        if self.def_levels[self.buffer_pos] == 0 {
+            Ok(false)
+        } else {
+            *output = self.buffer[self.buffer_pos - self.nulls_count].clone();
+            Ok(true)
         }
     }
 }
@@ -194,6 +236,7 @@ impl<T: DataType> Debug for ParquetColumnReader<T> {
 trait ParquetColumn {
     fn next_group(&mut self, reader: &dyn RowGroupReader);
     fn get(&mut self, position: usize) -> Result<Type, ProcessingError>;
+    fn get_into(&mut self, position: usize, result: &mut Type) -> Result<(), ProcessingError>;
 }
 
 impl<T> ParquetColumn for ParquetColumnReader<T>
@@ -211,6 +254,16 @@ where
             Output::Null => Ok(Type::Null),
             Output::Some(v) => Ok(v.clone().into()),
         }
+    }
+
+    //#[cfg_attr(feature = "hotpath", hotpath::measure())]
+    fn get_into(&mut self, position: usize, result: &mut Type) -> Result<(), ProcessingError> {
+        self.set_position(position);
+        match self.get()? {
+            Output::Null => *result = Type::Null,
+            Output::Some(v) => *result = v.clone().into(),
+        }
+        Ok(())
     }
 }
 
@@ -238,6 +291,8 @@ pub struct ParquetReaders {
     total_rows: usize,
     current_row_group: usize,
     file_reader: Box<dyn FileReader>,
+    values: Vec<Type>,
+    current: usize,
 }
 
 impl ParquetReaders {
@@ -281,12 +336,14 @@ impl ParquetReaders {
             current_row_group: 0,
             rows_in_group,
             file_reader,
+            values: vec![],
+            current: 0,
         };
         result.init_row_group(0);
         result
     }
 
-    fn init_row_group(&mut self, row_group: usize) {
+    pub fn init_row_group(&mut self, row_group: usize) {
         let row_group = self.file_reader.get_row_group(row_group).unwrap();
         for reader in &mut self.readers {
             reader.next_group(row_group.deref());
@@ -326,4 +383,73 @@ impl Readers for ParquetReaders {
             .find(|(_, v)| *v == name)
             .map(|(i, _)| i)
     }
+}
+
+impl Source for ParquetReaders {
+    // #[cfg_attr(feature = "hotpath", hotpath::measure())]
+    fn findx(
+        &mut self,
+        filter_columns: &[usize],
+        filter: &mut Box<dyn Filter>,
+    ) -> Result<bool, ProcessingError> {
+        if self.values.len() < filter_columns.len() {
+            self.values.resize(filter_columns.len(), Type::None);
+        }
+
+        while self.current < self.total_rows {
+            // can be optimised (put outside)
+            if self.current >= self.rows_in_group[self.current_row_group] {
+                self.current_row_group += 1;
+                self.init_row_group(self.current_row_group);
+            }
+            let offset = if self.current_row_group == 0 {
+                0
+            } else {
+                self.rows_in_group[self.current_row_group - 1]
+            };
+
+            let to = self.rows_in_group[self.current_row_group];
+            // hotpath::measure_block!("loop", {
+            for p in (self.current - offset)..(to - offset) {
+                // hotpath::measure_block!("loop get", {
+                for (i, &column) in filter_columns.iter().enumerate() {
+                    self.readers[column].get_into(p, &mut self.values[i])?;
+                }
+                // });
+                // hotpath::measure_block!("loop check", {
+                //self.current += 1;
+                if filter.check(&self.values) {
+                    self.current = p + offset + 1;
+                    return Ok(true);
+                }
+                // });
+            }
+            // });
+            self.current = to;
+        }
+        Ok(false)
+    }
+    fn get(&mut self, columns: &[usize]) -> Result<&[Type], ProcessingError> {
+        if self.values.len() < columns.len() {
+            self.values.resize(columns.len(), Type::None);
+        }
+        todo!();
+        Ok(&self.values)
+    }
+    /*
+     fn value(&mut self, row: usize, column: usize) -> Result<&Type, ProcessingError> {
+         if row >= self.rows_in_group[self.current_row_group] {
+             self.current_row_group += 1;
+             self.init_row_group(self.current_row_group);
+         }
+         let offset = if self.current_row_group == 0 {
+             0
+         } else {
+             self.rows_in_group[self.current_row_group - 1]
+         };
+         self.readers[column].get_ref(row - offset)
+    }
+     fn rows(&mut self) -> Result<usize, ProcessingError> {
+         Ok(self.total_rows)
+     }*/
 }
