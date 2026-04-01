@@ -16,6 +16,12 @@ pub enum ProcessingError {
     Parsing(#[from] ParsingError),
     #[error("Invaid buffer type")]
     InvalidBufferType,
+    #[error("No row groups found in the file")]
+    NoRowGroups,
+    #[error("Internal Error, column already over position")]
+    InternalErrorOverPosition,
+    #[error("Internal Error, no reader")]
+    InternalErrorNoReader,
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -86,13 +92,15 @@ pub trait Fold {
     fn fold(&self, current: &mut Type, value: Type);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ReaderType {
-    I32 = 0,
-    I64 = 1,
-    Bool = 2,
-    Double = 3,
-    String = 4,
+    I32,
+    I64,
+    I96,
+    Bool,
+    Float,
+    Double,
+    String,
 }
 
 //////////////////  implementations

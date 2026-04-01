@@ -267,21 +267,21 @@ where
     }
 }
 
-impl ReaderType {
-    fn convert(physical_type: PhysicalType, logical_type: Option<LogicalType>) -> Self {
-        match (physical_type, logical_type) {
-            (PhysicalType::BOOLEAN, None) => ReaderType::Bool,
-            (PhysicalType::INT32, None) => ReaderType::I32,
-            (PhysicalType::INT64, None) => ReaderType::I64,
-            (PhysicalType::INT96, None) => todo!(),
-            (PhysicalType::FLOAT, None) => todo!(),
-            (PhysicalType::DOUBLE, None) => ReaderType::Double,
-            (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)) => ReaderType::String,
-            (PhysicalType::FIXED_LEN_BYTE_ARRAY, None) => todo!(),
-            _ => todo!(),
-        }
-    }
-}
+// impl ReaderType {
+//     fn convert(physical_type: PhysicalType, logical_type: Option<LogicalType>) -> Self {
+//         match (physical_type, logical_type) {
+//             (PhysicalType::BOOLEAN, None) => ReaderType::Bool,
+//             (PhysicalType::INT32, None) => ReaderType::I32,
+//             (PhysicalType::INT64, None) => ReaderType::I64,
+//             (PhysicalType::INT96, None) => todo!(),
+//             (PhysicalType::FLOAT, None) => todo!(),
+//             (PhysicalType::DOUBLE, None) => ReaderType::Double,
+//             (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)) => ReaderType::String,
+//             (PhysicalType::FIXED_LEN_BYTE_ARRAY, None) => todo!(),
+//             _ => todo!(),
+//         }
+//     }
+// }
 
 pub struct ParquetReaders {
     names: Vec<String>,
